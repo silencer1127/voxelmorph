@@ -83,25 +83,35 @@ class NCC:
 
 class MSE:
     """
-    Mean squared error loss.
+    Deprecated. Use neurite.nn.modules.MSE instead.
     """
 
+    def __init__(self, *args, **kwargs):
+        raise DeprecationWarning(
+            "voxelmorph.nn.losses.MSE is deprecated. Use neurite.nn.modules.MSE instead."
+        )
+
     def loss(self, y_true, y_pred):
-        return torch.mean((y_true - y_pred) ** 2)
+        raise DeprecationWarning(
+            "voxelmorph.nn.losses.MSE is deprecated. Use neurite.nn.modules.MSE instead."
+        )
 
 
 class Dice:
     """
-    N-D dice for segmentation
+    Deprecated. Use neurite.nn.modules.Dice instead.
     """
 
+    def __init__(self, *args, **kwargs):
+        raise DeprecationWarning(
+            "voxelmorph.nn.losses.Dice is deprecated. Use neurite.nn.modules.Dice instead."
+        )
+
     def loss(self, y_true, y_pred):
-        ndims = len(list(y_pred.size())) - 2
-        vol_axes = list(range(2, ndims + 2))
-        top = 2 * (y_true * y_pred).sum(dim=vol_axes)
-        bottom = torch.clamp((y_true + y_pred).sum(dim=vol_axes), min=1e-5)
-        dice = torch.mean(top / bottom)
-        return -dice
+        raise DeprecationWarning(
+            "voxelmorph.nn.losses.Dice is deprecated. Use neurite.nn.modules.Dice instead."
+        )
+
 
 class Grad:
     """

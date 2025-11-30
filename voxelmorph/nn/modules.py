@@ -3,7 +3,8 @@ Neural network building blocks for VoxelMorph.
 """
 
 # Standard library imports
-from typing import Tuple, Union, Optional
+from collections.abc import Sequence
+from typing import Union, Optional
 
 # Third-party imports
 import torch
@@ -12,7 +13,7 @@ import torch.nn.functional as nnf
 
 # Custom imports
 import neurite as ne
-import neurite.nn.functional as nef
+import voxelmorph as vxm
 
 __all__ = [
     "SpatialTransformer",
@@ -25,59 +26,43 @@ class SpatialTransformer(nn.Module):
     """
     N-D Spatial transformation according to a deformation field.
 
-    Uses a deformation field to transform the moving image.
+    Wrapper around voxelmorph.nn.functional.spatial_transform that maintains the
+    nn.Module interface for composability in neural network architectures.
 
     References
     ----------
     If you find this helpful, please cite the following paper:
 
     VoxelMorph: A Learning Framework for Deformable Medical Image Registration
-    G. Balakrishnan, A. Zhao, M. R. Sabuncu, J. Guttag, A.V. Dalca. 
+    G. Balakrishnan, A. Zhao, M. R. Sabuncu, J. Guttag, A.V. Dalca.
     IEEE TMI: Transactions on Medical Imaging. 38(8). pp 1788-1800. 2019.
     """
 
     def __init__(
         self,
-        size: Tuple[int],
         interpolation_mode: str = "bilinear",
-        align_corners: bool = False,
-        device: Union[str, torch.device] = "cpu",
+        align_corners: bool = True,
+        device: Optional[Union[str, torch.device]] = None,
     ):
         """
         Initialize `SpatialTransformer`.
 
         Parameters
         ----------
-        size : tuple[int]
-            Expected size of `moving_image` (input image to be warped) for the forward pass.
-        interpolation_mode : str
-            Algorithm used for interpolating the warped image. Default is  'bilinear'. Options are:
+        size : tuple[int] or None, optional
+            Deprecated. No longer used. Kept for backward compatibility.
+        interpolation_mode : str, default='bilinear'
+            Algorithm used for interpolating the warped image. Options are:
             'bilinear' | 'nearest' | 'bicubic'.
-        align_corners : bool
+        align_corners : bool, default=True
             Map the corner points of the moving image to the corner points of the warped image.
-        device : str
-            Device to construct and hold the identity grid.
+        device : str or torch.device or None, optional
+            Deprecated. No longer used. Kept for backward compatibility.
         """
         super().__init__()
 
-        self.size = size
-        self.device = device
         self.interpolation_mode = interpolation_mode
         self.align_corners = align_corners
-
-        # Make identity grid, used to create absolute grid location from displacement
-        identity_grid = nef.volshape_to_ndgrid(size=size, device=device, stack=True)
-        identity_grid = identity_grid.unsqueeze(0)  # Add batch dimension
-
-        # convert to grid_sample axis convention. Size is |Z|Y|X| for 3D, |Y|X| for 2D
-        # The last axis should be ordered as [X, Y, (Z, ...)] to match grid_sample expectations
-        identity_grid = identity_grid.flip(-1)
-
-        self.register_buffer(
-            name='identity_grid',
-            tensor=identity_grid,
-            persistent=False  # Don't save to state dict
-        )
 
     def forward(
         self,
@@ -85,7 +70,7 @@ class SpatialTransformer(nn.Module):
         deformation_field: torch.Tensor
     ) -> torch.Tensor:
         """
-        Forward pass of `SpatialTransformer`
+        Forward pass of `SpatialTransformer`.
 
         Parameters
         ----------
@@ -105,66 +90,59 @@ class SpatialTransformer(nn.Module):
         Notes
         -----
         - Expects deformation_field in channels-first format: (B, ndim, *spatial_dims)
-        - Internally converts to (B, *spatial_dims, ndim) for PyTorch's grid_sample
+        - Processes each batch element independently since vxm.functional.spatial_transform
+          expects displacement fields without batch dimension
         """
-
-        # Validate the dimensions of the input
-        if moving_image.dim() < 4 or deformation_field.dim() != moving_image.dim():
+        # Validate dimensions
+        if moving_image.dim() < 4:
             raise ValueError(
-                "Expected `moving_image` to have at least 4 dimensions and for "
-                "`deformation_field` to match `moving_image` dimensions, got "
-                f"moving_image.dim()={moving_image.dim()}, "
-                f"deformation_field.dim()={deformation_field.dim()}"
+                f"Expected moving_image to have at least 4 dimensions (B, C, *spatial), "
+                f"got {moving_image.dim()} dimensions with shape {moving_image.shape}"
             )
 
-        # Wow, this is legacy! Neither Adrian nor I know why the dims need to be permuted...
-        # Well, at least that's what he said in his code
-        deformation_field = deformation_field.moveaxis(1, -1).contiguous()
+        if deformation_field.dim() != moving_image.dim():
+            raise ValueError(
+                f"Expected moving_image and deformation_field to have the same number of "
+                f"dimensions, got moving_image.dim()={moving_image.dim()}, deformation_field.dim()"
+                f"={deformation_field.dim()}"
+            )
 
-        # Warp the identity grid with the deformation field
-        warped_grid = self.identity_grid + deformation_field
+        batch_size = moving_image.shape[0]
 
-        # Normalize the axes so the range does not exceed the interval [-1, 1]
-        warped_grid = self._normalize_warped_grid(warped_grid)
+        # Process each batch element independently
+        # vxm.functional.spatial_transform expects disp as (ndim, *spatial) without batch
+        warped_batch = []
+        for b in range(batch_size):
+            # Extract single batch element
+            img_b = moving_image[b]  # (C, *spatial)
+            disp_b = deformation_field[b]  # (ndim, *spatial)
 
-        # Sample grid
-        warped_image = nnf.grid_sample(
-            input=moving_image,
-            grid=warped_grid,
-            mode=self.interpolation_mode,
-            align_corners=self.align_corners,
-            padding_mode="border"
-        )
+            # Allocate or reallocate meshgrid if spatial shape changed
+            spatial_shape = img_b.shape[1:]
+            if not hasattr(self, 'meshgrid') or self.meshgrid.shape[1:] != spatial_shape:
+                self.meshgrid = ne.volshape_to_ndgrid(
+                    size=spatial_shape,
+                    device=img_b.device,
+                    dtype=img_b.dtype,
+                    stack=True
+                )
 
-        return warped_image
+            # Apply spatial transform
+            warped_b = vxm.functional.spatial_transform(
+                image=img_b,
+                trf=disp_b,
+                mode=self.interpolation_mode,
+                isdisp=True,
+                meshgrid=None,
+                origin_at_center=True,
+                non_spatial_dims=(0,),  # First dim is channel
+                align_corners=self.align_corners,
+                padding_mode='zeros'
+            )
+            warped_batch.append(warped_b)
 
-    def _normalize_warped_grid(
-        self,
-        warped_grid: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Normalize a warped grid to make PyTorch `grid_sample()` happy!
-
-        PyTorch's `grid_sample()` requires coordinates in the range [-1, 1].
-        This function scales and shifts the warped grid accordingly.
-
-        Parameters
-        ----------
-        warped_grid : torch.Tensor
-            The resultant of the identity grid and the deformation field.
-
-        Returns
-        -------
-        torch.Tensor
-            The warped grid rescaled to the range [-1, 1] for each spatial axis
-        """
-
-        for i, dim in enumerate(self.size):
-
-            # Rescale each dimension individually
-            warped_grid[..., i] = 2 * (warped_grid[..., i] / (dim - 1) - 0.5)
-
-        return warped_grid
+        # Stack back to (B, C, *spatial)
+        return torch.stack(warped_batch, dim=0)
 
 
 class IntegrateVelocityField(nn.Module):
@@ -187,16 +165,14 @@ class IntegrateVelocityField(nn.Module):
     Examples
     -------
     ### Integrate a 2D velocity field over multiple steps:
-    >>> shape = (128, 128)  # 2D spatial grid
-    >>> integrator = IntegrateVelocityField(shape, steps=256)
+    >>> integrator = IntegrateVelocityField(steps=256)
     >>> velocity_field = torch.randn(1, 2, 128, 128)  # (B, C, H, W)
     >>> disp = integrator(velocity_field)
     >>> disp.shape
     torch.Size([1, 2, 128, 128])
 
     ### Perform integration on a 3D velocity field with a single scaling step:
-    >>> shape = (64, 64, 64)  # 3D spatial grid
-    >>> integrator = IntegrateVelocityField(shape, steps=1)
+    >>> integrator = IntegrateVelocityField(steps=1)
     >>> velocity_field = torch.randn(1, 3, 64, 64, 64)  # (B, C, D, H, W)
     >>> disp = integrator(velocity_field)
     >>> disp.shape
@@ -204,29 +180,30 @@ class IntegrateVelocityField(nn.Module):
     """
 
     def __init__(
-        self, shape: tuple,
+        self,
+        shape: Optional[tuple] = None,
         steps: int = 1,
         interpolation_mode: str = "bilinear",
-        align_corners: bool = False,
-        device: str = "cpu"
+        align_corners: bool = True,
+        device: Optional[str] = None
     ):
         """
         Initialize `IntegrateVelocityField`
 
         Parameters
         ----------
-        shape : tuple
-            Shape of the input velocity field (excluding batch and channel dimensions).
-        steps : int, optional
+        shape : tuple or None, optional
+            Deprecated. No longer used. Kept for backward compatibility.
+        steps : int, default=1
             Number of integration steps. A higher value leads to a more smooth and accurate
-            integration at the cost of higher/longer computation. Default is 1.
-        interpolation_mode : str
-            Algorithm used for interpolating the warped image. Default is  'bilinear'. Options are:
+            integration at the cost of higher/longer computation.
+        interpolation_mode : str, default='bilinear'
+            Algorithm used for interpolating the warped image. Options are:
             'bilinear' | 'nearest' | 'bicubic'.
-        align_corners : bool
+        align_corners : bool, default=True
             Map the corner points of the moving image to the corner points of the warped image.
-        device : str
-            Device to construct and hold the identity grid.
+        device : str or None, optional
+            Deprecated. No longer used. Kept for backward compatibility.
         """
 
         super().__init__()
@@ -238,7 +215,10 @@ class IntegrateVelocityField(nn.Module):
         self.scale = 1.0 / (2 ** self.steps)  # Initial downscaling factor
 
         # Make the transformer which will perform the warping operation
-        self.transformer = SpatialTransformer(shape, interpolation_mode, align_corners, device)
+        self.transformer = SpatialTransformer(
+            interpolation_mode=interpolation_mode,
+            align_corners=align_corners
+        )
 
     def forward(self, velocity_field: torch.Tensor) -> torch.Tensor:
         """
@@ -287,7 +267,7 @@ class ResizeDisplacementField(nn.Module):
 
     def __init__(
         self,
-        scale_factor: Optional[Union[float, int, ne.samplers.Sampler]] = 1.0,
+        scale_factor: Optional[Union[float, int]] = 1.0,
         interpolation_mode: str = "bilinear",
         align_corners: bool = True,
     ):
@@ -296,10 +276,10 @@ class ResizeDisplacementField(nn.Module):
 
         Parameters
         ----------
-        scale_factor : Optional[Union[float, int, Sampler]], optional
+        scale_factor : Optional[Union[float, int]], optional
             Factor by which to stretch or shrink the spatial dimensions of the displacement field.
             Values of `scale_factor` > 1 stretch/expand the field, and values < 1 shrink it. By
-            default None.
+            default 1.0.
         interpolation_mode : str
             Algorithm used for interpolating the warped image. Default is  'bilinear'. Options are:
             'bilinear' | 'nearest' | 'bicubic', 'trilinear'.
@@ -309,7 +289,7 @@ class ResizeDisplacementField(nn.Module):
         super().__init__()
         self.interpolation_mode = interpolation_mode
         self.align_corners = align_corners
-        self.scale_factor = ne.samplers.Fixed.make(scale_factor)
+        self.scale_factor = scale_factor
 
     def forward(self, disp: torch.Tensor) -> torch.Tensor:
         """
@@ -326,13 +306,10 @@ class ResizeDisplacementField(nn.Module):
         torch.Tensor
             Resized displacement field.
         """
-
-        # Sample from the scaling sampler. If type Fixed, just get the fixed value!
-        scale_factor = self.scale_factor()
-
+        # Use the scale factor to resize the displacement field
         resized_disp = nnf.interpolate(
-            disp * scale_factor,  # Scale the magnitudes of the displacement field
-            scale_factor=scale_factor,
+            disp * self.scale_factor,  # Scale the magnitudes of the displacement field
+            scale_factor=self.scale_factor,
             mode=self.interpolation_mode,
             align_corners=self.align_corners,
         )

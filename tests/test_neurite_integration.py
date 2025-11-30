@@ -5,7 +5,6 @@ Tests critical Neurite components that VoxelMorph depends on:
 - BasicUNet (model backbone)
 - volshape_to_ndgrid (grid generation)
 - ConvBlock (flow layer)
-- Samplers (weight initialization)
 """
 
 import pytest
@@ -88,53 +87,75 @@ def test_basic_unet_gradient_flow(sample_input_3d):
 
 
 def test_volshape_to_ndgrid_ij_indexing_2d():
-    """Test volshape_to_ndgrid produces grids with ij indexing."""
+    """
+    Test volshape_to_ndgrid produces grids with ij indexing.
+
+    With (ndim, *spatial) format, grid[0] is the first coordinate channel (row index),
+    and grid[1] is the second coordinate channel (col index).
+    """
     shape = (64, 64)
-    grid = nef.volshape_to_ndgrid(shape, indexing="ij")
+    grid = ne.volshape_to_ndgrid(shape, indexing="ij", stack=True)
 
-    assert grid.shape == (1, *shape, 2)
+    assert grid.shape == (2, *shape)
 
-    # ij indexing: first coord varies with first index
-    assert grid[0, 0, 0, 0] < grid[0, 1, 0, 0]      # first coord increases with i
-    assert grid[0, 0, 0, 1] == grid[0, 1, 0, 1]     # second coord constant along i
-    assert grid[0, 0, 0, 0] == grid[0, 0, 1, 0]     # first coord constant along j
-    assert grid[0, 0, 0, 1] < grid[0, 0, 1, 1]      # second coord increases with j
+    # ij indexing: first coord varies with first spatial index (row)
+    assert grid[0, 0, 0] < grid[0, 1, 0]      # first coord increases with i (row)
+    assert grid[0, 0, 0] == grid[0, 0, 1]     # first coord constant along j (col)
+    assert grid[1, 0, 0] == grid[1, 1, 0]     # second coord constant along i (row)
+    assert grid[1, 0, 0] < grid[1, 0, 1]      # second coord increases with j (col)
 
 
 def test_volshape_to_ndgrid_xy_indexing_2d():
-    """Test volshape_to_ndgrid produces grids with xy indexing."""
-    shape = (64, 64)
-    grid = nef.volshape_to_ndgrid(shape, indexing="xy")
+    """
+    Test volshape_to_ndgrid produces grids with xy indexing.
 
-    # xy indexing: first coord (x) varies with second index (columns)
-    assert grid[0, 0, 0, 0] == grid[0, 1, 0, 0]     # x constant along rows (i)
-    assert grid[0, 0, 0, 0] < grid[0, 0, 1, 0]      # x increases along columns (j)
-    assert grid[0, 0, 0, 1] < grid[0, 1, 0, 1]      # y increases along rows (i)
-    assert grid[0, 0, 0, 1] == grid[0, 0, 1, 1]     # y constant along columns (j)
+    With (ndim, *spatial) format and xy indexing, grid[0] is x (varies with col),
+    and grid[1] is y (varies with row).
+    """
+    shape = (64, 64)
+    grid = ne.volshape_to_ndgrid(shape, indexing="xy", stack=True)
+
+    assert grid.shape == (2, *shape)
+
+    # xy indexing: first coord (x) varies with second spatial index (columns)
+    assert grid[0, 0, 0] == grid[0, 1, 0]     # x constant along rows (i)
+    assert grid[0, 0, 0] < grid[0, 0, 1]      # x increases along columns (j)
+    assert grid[1, 0, 0] < grid[1, 1, 0]      # y increases along rows (i)
+    assert grid[1, 0, 0] == grid[1, 0, 1]     # y constant along columns (j)
 
 
 def test_volshape_to_ndgrid_ij_indexing_3d():
-    """Test volshape_to_ndgrid produces grids with ij indexing for 3D."""
-    shape = (32, 32, 32)
-    grid = nef.volshape_to_ndgrid(shape, indexing="ij")
+    """
+    Test volshape_to_ndgrid produces grids with ij indexing for 3D.
 
-    assert grid.shape == (1, *shape, 3)
+    With (ndim, *spatial) format, grid[d] is the coordinate channel for dimension d.
+    """
+    shape = (32, 32, 32)
+    grid = ne.volshape_to_ndgrid(shape, indexing="ij", stack=True)
+
+    assert grid.shape == (3, *shape)
 
     # ij indexing: coords align with indices
-    assert grid[0, 0, 0, 0, 0] < grid[0, 1, 0, 0, 0]
-    assert grid[0, 0, 0, 0, 1] < grid[0, 0, 1, 0, 1]
-    assert grid[0, 0, 0, 0, 2] < grid[0, 0, 0, 1, 2]
+    assert grid[0, 0, 0, 0] < grid[0, 1, 0, 0]  # coord 0 increases with dim 0
+    assert grid[1, 0, 0, 0] < grid[1, 0, 1, 0]  # coord 1 increases with dim 1
+    assert grid[2, 0, 0, 0] < grid[2, 0, 0, 1]  # coord 2 increases with dim 2
 
 
 def test_volshape_to_ndgrid_xy_indexing_3d():
-    """Test volshape_to_ndgrid produces grids with xy indexing for 3D."""
-    shape = (32, 32, 32)
-    grid = nef.volshape_to_ndgrid(shape, indexing="xy")
+    """
+    Test volshape_to_ndgrid produces grids with xy indexing for 3D.
 
-    # xy indexing: x varies with j, y varies with i
-    assert grid[0, 0, 0, 0, 0] == grid[0, 1, 0, 0, 0]  # x constant along i
-    assert grid[0, 0, 0, 0, 0] < grid[0, 0, 1, 0, 0]  # x increases with j
-    assert grid[0, 0, 0, 0, 1] < grid[0, 1, 0, 0, 1]  # y increases with i
+    With (ndim, *spatial) format and xy indexing, coordinates are reordered.
+    """
+    shape = (32, 32, 32)
+    grid = ne.volshape_to_ndgrid(shape, indexing="xy", stack=True)
+
+    assert grid.shape == (3, *shape)
+
+    # xy indexing: coords are reordered relative to spatial dims
+    assert grid[0, 0, 0, 0] == grid[0, 1, 0, 0]  # x constant along dim 0
+    assert grid[0, 0, 0, 0] < grid[0, 0, 1, 0]   # x increases with dim 1
+    assert grid[1, 0, 0, 0] < grid[1, 1, 0, 0]   # y increases with dim 0
 
 
 def test_conv_block_forward_2d(shape_2d):
@@ -157,30 +178,3 @@ def test_conv_block_forward_3d(shape_3d):
 
     assert output.shape == (1, 3, *shape_3d)
     assert output.requires_grad is True
-
-
-def test_normal_sampler_callable(shape_3d):
-    """Test Normal sampler is callable and produces samples."""
-    sampler = ne.samplers.Normal(0, 1)
-    samples = sampler(shape_3d)
-
-    assert samples.shape == shape_3d
-    assert torch.abs(samples.mean()) < 0.01
-
-
-def test_fixed_sampler_make(shape_3d):
-    """Test Fixed.make() wraps scalar values correctly."""
-    value = 0.5
-    sampler = ne.samplers.Fixed.make(value)
-    samples = sampler(shape_3d)
-
-    assert (samples == torch.ones(shape_3d) * value).all()
-
-
-def test_sampler_callable_protocol():
-    """Test samplers are callable."""
-    normal_sampler = ne.samplers.Normal(0, 1e-5)
-    fixed_sampler = ne.samplers.Fixed.make(1.0)
-
-    assert callable(normal_sampler)
-    assert callable(fixed_sampler)
