@@ -3,7 +3,6 @@ Neural network building blocks for VoxelMorph.
 """
 
 # Standard library imports
-from collections.abc import Sequence
 from typing import Union, Optional
 
 # Third-party imports
@@ -14,12 +13,6 @@ import torch.nn.functional as nnf
 # Custom imports
 import neurite as ne
 import voxelmorph as vxm
-
-__all__ = [
-    "SpatialTransformer",
-    "IntegrateVelocityField",
-    "ResizeDisplacementField",
-]
 
 
 class SpatialTransformer(nn.Module):
@@ -93,56 +86,33 @@ class SpatialTransformer(nn.Module):
         - Processes each batch element independently since vxm.functional.spatial_transform
           expects displacement fields without batch dimension
         """
-        # Validate dimensions
-        if moving_image.dim() < 4:
-            raise ValueError(
-                f"Expected moving_image to have at least 4 dimensions (B, C, *spatial), "
-                f"got {moving_image.dim()} dimensions with shape {moving_image.shape}"
+        assert moving_image.dim() >= 4, (
+            f"moving_image must have >=4 dims (B,C,*spatial), got {moving_image.shape}"
+        )
+        assert deformation_field.dim() == moving_image.dim(), (
+            f"dim mismatch: moving={moving_image.dim()}, field={deformation_field.dim()}"
+        )
+
+        # Allocate or reallocate meshgrid if spatial shape changed
+        spatial_shape = moving_image.shape[2:]
+        if not hasattr(self, 'meshgrid') or self.meshgrid.shape[1:] != spatial_shape:
+            self.meshgrid = ne.volshape_to_ndgrid(
+                size=spatial_shape,
+                device=moving_image.device,
+                dtype=moving_image.dtype,
+                stack=True
             )
 
-        if deformation_field.dim() != moving_image.dim():
-            raise ValueError(
-                f"Expected moving_image and deformation_field to have the same number of "
-                f"dimensions, got moving_image.dim()={moving_image.dim()}, deformation_field.dim()"
-                f"={deformation_field.dim()}"
-            )
-
-        batch_size = moving_image.shape[0]
-
-        # Process each batch element independently
-        # vxm.functional.spatial_transform expects disp as (ndim, *spatial) without batch
-        warped_batch = []
-        for b in range(batch_size):
-            # Extract single batch element
-            img_b = moving_image[b]  # (C, *spatial)
-            disp_b = deformation_field[b]  # (ndim, *spatial)
-
-            # Allocate or reallocate meshgrid if spatial shape changed
-            spatial_shape = img_b.shape[1:]
-            if not hasattr(self, 'meshgrid') or self.meshgrid.shape[1:] != spatial_shape:
-                self.meshgrid = ne.volshape_to_ndgrid(
-                    size=spatial_shape,
-                    device=img_b.device,
-                    dtype=img_b.dtype,
-                    stack=True
-                )
-
-            # Apply spatial transform
-            warped_b = vxm.functional.spatial_transform(
-                image=img_b,
-                trf=disp_b,
-                mode=self.interpolation_mode,
-                isdisp=True,
-                meshgrid=None,
-                origin_at_center=True,
-                non_spatial_dims=(0,),  # First dim is channel
-                align_corners=self.align_corners,
-                padding_mode='zeros'
-            )
-            warped_batch.append(warped_b)
-
-        # Stack back to (B, C, *spatial)
-        return torch.stack(warped_batch, dim=0)
+        return vxm.functional.spatial_transform(
+            image=moving_image,
+            trf=deformation_field,
+            mode=self.interpolation_mode,
+            isdisp=True,
+            meshgrid=self.meshgrid,
+            non_spatial_dims=(0, 1),
+            align_corners=self.align_corners,
+            padding_mode='zeros'
+        )
 
 
 class IntegrateVelocityField(nn.Module):
@@ -208,8 +178,7 @@ class IntegrateVelocityField(nn.Module):
 
         super().__init__()
 
-        if steps < 0:
-            raise ValueError(f"steps should be >= 0, found: {steps}")
+        assert steps >= 0, f"steps must be >= 0, got {steps}"
 
         self.steps = steps
         self.scale = 1.0 / (2 ** self.steps)  # Initial downscaling factor
