@@ -34,6 +34,7 @@ License.
 # Core library imports
 import argparse
 from typing import Sequence
+from pathlib import Path
 
 # Third-party imports
 import numpy as np
@@ -42,10 +43,9 @@ import torch
 from torch import nn
 from torch.utils.data import IterableDataset, DataLoader
 from tqdm import tqdm
-from pathlib import Path
+import neurite as ne
 
 # Local imports
-import neurite as ne
 import voxelmorph as vxm
 
 
@@ -175,6 +175,11 @@ def main():
     parser.add_argument('--lambda', type=float, dest='lambda_param', default=0.01)
     parser.add_argument('--gpu', type=str, default='0', help='GPU ID')
     parser.add_argument('--save-every', type=int, default=10, help='Checkpoint every N epochs')
+    parser.add_argument('--patience', type=int, default=20, help='Early stopping patience')
+    parser.add_argument('--threshold', type=float, default=0.0, help='Early stopping threshold')
+    parser.add_argument(
+        '--warm-start', type=int, default=10, help='Early stopping warm start steps'
+    )
     args = parser.parse_args()
 
     # Set device
@@ -213,6 +218,7 @@ def main():
     # Training loop
     print(f'Training for {args.epochs} epochs...')
     best_loss = float('inf')
+    loss_history = []
     for epoch in tqdm(range(args.epochs), desc='Epochs'):
 
         # Train for one epoch
@@ -227,16 +233,29 @@ def main():
             device=device
         )
 
+        # Track loss history
+        loss_history.append(avg_loss)
+
         # Print progress
         if (epoch + 1) % 10 == 0:
-            print(f'Epoch {epoch+1}/{args.epochs}, Loss: {avg_loss:.6f}')
+            print(f'Epoch {epoch + 1}/{args.epochs}, Loss: {avg_loss:.6f}')
+
+        # Early stopping check
+        if ne.utils.early_stopping(
+            loss_history,
+            patience=args.patience,
+            threshold=args.threshold,
+            warm_start_steps=args.warm_start
+        ):
+            print(f'Early stopping at epoch {epoch + 1}')
+            break
 
         # Save periodic checkpoints
         if (epoch + 1) % args.save_every == 0:
 
             # Build checkpoint file name
             checkpoint_path = output_path.parent.joinpath(
-                f'{output_path.stem}_default-int_epoch{epoch+1}.pt'
+                f'{output_path.stem}_default-int_epoch{epoch + 1}.pt'
             )
 
             # Save

@@ -1,11 +1,12 @@
 """
 Single tensor operations (no B, C, dimensions assumption)
 """
+# Core library imports
 from typing import Union, Sequence, Tuple, Literal
 
+# Third-party imports
 import numpy as np
 import torch
-
 import neurite as ne
 
 __all__ = [
@@ -13,10 +14,13 @@ __all__ = [
     'angles_to_rotation_matrix',
     'params_to_affine',
     'random_affine',
+    'disp_to_trf',
+    'trf_to_disp',
     'disp_to_coords',
     'coords_to_disp',
     'spatial_transform',
     'integrate_disp',
+    'resize_disp',
     'constant_shift_field',
     'compose',
     'is_affine_shape',
@@ -336,9 +340,135 @@ def affine_to_disp(
     return disp_flat.reshape(*output_shape)
 
 
+def disp_to_trf(
+    disp: torch.Tensor,
+    grid: Union[torch.Tensor, None] = None,
+    non_spatial_dims: Union[Tuple[int, ...], None] = None
+) -> torch.Tensor:
+    """
+    Convert displacement field to transformation (deformation) field.
+
+    Adds an identity coordinate grid to the displacement field to produce
+    absolute sampling coordinates.
+
+    Parameters
+    ----------
+    disp : torch.Tensor
+        Displacement field with shape (ndim, *spatial) or (B, ndim, *spatial).
+        The ndim dimension contains vector components and is not considered spatial.
+    grid : torch.Tensor or None, default=None
+        Pre-computed identity coordinate grid of shape (ndim, *spatial). If None,
+        computed from displacement field shape. Useful to avoid recomputing the
+        grid in training loops.
+    non_spatial_dims : Tuple[int, ...] or None, default=None
+        Batch dimensions preceding the ndim dimension. Use (0,) for batched input
+        (B, ndim, *spatial). If None, assumes unbatched (ndim, *spatial).
+
+    Returns
+    -------
+    torch.Tensor
+        Transformation field with the same shape as input.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import voxelmorph as vxm
+    >>> # 2d displacement field
+    >>> disp = torch.zeros(2, 64, 64)
+    >>> trf = vxm.disp_to_trf(disp)
+    >>> trf.shape
+    torch.Size([2, 64, 64])
+
+    >>> # With batch dimension
+    >>> disp = torch.zeros(4, 2, 64, 64)
+    >>> trf = vxm.disp_to_trf(disp, non_spatial_dims=(0,))
+    >>> trf.shape
+    torch.Size([4, 2, 64, 64])
+
+    >>> # With pre-computed grid (for performance in training loops)
+    >>> import neurite as ne
+    >>> grid = ne.volshape_to_ndgrid((64, 64), stack=True)
+    >>> trf = vxm.disp_to_trf(disp, grid=grid, non_spatial_dims=(0,))
+
+    See Also
+    --------
+    trf_to_disp : Inverse operation.
+    """
+    if grid is None:
+        num_non_spatial, _ = ne.functional._parse_non_spatial_dims(non_spatial_dims, disp.dim())
+        spatial_shape = disp.shape[num_non_spatial + 1:]
+        grid = ne.volshape_to_ndgrid(
+            size=spatial_shape, device=disp.device, dtype=disp.dtype, stack=True
+        )
+    return disp + grid
+
+
+def trf_to_disp(
+    trf: torch.Tensor,
+    grid: Union[torch.Tensor, None] = None,
+    non_spatial_dims: Union[Tuple[int, ...], None] = None
+) -> torch.Tensor:
+    """
+    Convert transformation (deformation) field to displacement field.
+
+    Subtracts an identity coordinate grid from the transformation field.
+
+    Parameters
+    ----------
+    trf : torch.Tensor
+        Transformation field with shape (ndim, *spatial) or (B, ndim, *spatial).
+        The ndim dimension contains vector components and is not considered spatial.
+    grid : torch.Tensor or None, default=None
+        Pre-computed identity coordinate grid of shape (ndim, *spatial). If None,
+        computed from transformation field shape. Useful to avoid recomputing the
+        grid in training loops.
+    non_spatial_dims : Tuple[int, ...] or None, default=None
+        Batch dimensions preceding the ndim dimension. Use (0,) for batched input
+        (B, ndim, *spatial). If None, assumes unbatched (ndim, *spatial).
+
+    Returns
+    -------
+    torch.Tensor
+        Displacement field with the same shape as input.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import voxelmorph as vxm
+    >>> # Identity transformation produces zero displacement
+    >>> import neurite as ne
+    >>> trf = ne.volshape_to_ndgrid((8, 8), stack=True)
+    >>> disp = vxm.trf_to_disp(trf)
+    >>> disp.abs().max()
+    tensor(0.)
+
+    >>> # Round-trip conversion
+    >>> original = torch.randn(2, 32, 32)
+    >>> recovered = vxm.trf_to_disp(vxm.disp_to_trf(original))
+    >>> torch.allclose(original, recovered, atol=1e-5)
+    True
+
+    >>> # With pre-computed grid
+    >>> grid = ne.volshape_to_ndgrid((32, 32), stack=True)
+    >>> disp = vxm.trf_to_disp(trf, grid=grid)
+
+    See Also
+    --------
+    disp_to_trf : Inverse operation.
+    """
+    if grid is None:
+        num_non_spatial, _ = ne.functional._parse_non_spatial_dims(non_spatial_dims, trf.dim())
+        spatial_shape = trf.shape[num_non_spatial + 1:]
+        grid = ne.volshape_to_ndgrid(
+            size=spatial_shape, device=trf.device, dtype=trf.dtype, stack=True
+        )
+    return trf - grid
+
+
 def disp_to_coords(
     disp: torch.Tensor,
-    meshgrid: Union[torch.Tensor, None] = None,
+    meshgrid: torch.Tensor | None = None,
+    non_spatial_dims: Tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """
     Convert displacement field to normalized coordinates in [-1, 1] range for grid_sample.
@@ -348,41 +478,61 @@ def disp_to_coords(
     Parameters
     ----------
     disp : torch.Tensor
-        Displacement field with shape (ndim, *spatial).
+        Displacement field with shape (ndim, *spatial) or (B, ndim, *spatial) if batched.
     meshgrid : torch.Tensor or None, default=None
         Pre-computed coordinate grid of shape (ndim, *spatial). If None, computed
         from displacement field shape.
+    non_spatial_dims : tuple[int, ...] or None, default=None
+        Indices of non-spatial dimensions preceding the ndim dimension:
+        - None: tensor is (ndim, *spatial), unbatched
+        - (0,): tensor is (B, ndim, *spatial), batched
 
     Returns
     -------
     torch.Tensor
-        Normalized coordinates in range [-1, 1] with shape (ndim, *spatial).
+        Normalized coordinates in range [-1, 1] with same shape as input.
 
     Examples
     --------
-    >>> # 2D displacement field (ndim, H, W)
+    >>> # 2d displacement field (ndim, H, W)
     >>> disp = torch.randn(2, 64, 64)
     >>> coords = disp_to_coords(disp)
     >>> coords.shape
     torch.Size([2, 64, 64])
+
+    >>> # Batched displacement field (B, ndim, H, W)
+    >>> disp = torch.randn(4, 2, 64, 64)
+    >>> coords = disp_to_coords(disp, non_spatial_dims=(0,))
+    >>> coords.shape
+    torch.Size([4, 2, 64, 64])
     """
-    ndim = disp.shape[0]
-    spatial_shape = disp.shape[1:]
+    num_non_spatial, num_spatial = ne.functional._parse_non_spatial_dims(
+        non_spatial_dims=non_spatial_dims,
+        tensor_ndim=disp.ndim - 1  # subtract 1 for ndim dimension
+    )
+
+    has_batch = num_non_spatial == 1
+    ndim_axis = 1 if has_batch else 0
+    ndim = disp.shape[ndim_axis]
+    spatial_shape = disp.shape[ndim_axis + 1:]
 
     if meshgrid is None:
-        meshgrid = ne.volshape_to_ndgrid(size=spatial_shape, device=disp.device, stack=True)
+        meshgrid = ne.volshape_to_ndgrid(
+            size=spatial_shape,
+            device=disp.device,
+            dtype=disp.dtype,
+            stack=True,
+        )
 
     coords = meshgrid + disp
 
     # Normalize each spatial dimension to [-1, 1]
-    for d in range(ndim):
-        size = spatial_shape[d]
-        if size > 1:
-            coords[d] = coords[d] * 2 / (size - 1) - 1
-        else:
-            coords[d] = 0
+    sizes = torch.tensor(spatial_shape, device=disp.device, dtype=disp.dtype)
+    scales = 2.0 / (sizes - 1).clamp(min=1)  # avoid div by zero for size=1
+    broadcast_shape = (ndim,) + (1,) * num_spatial
+    scales = scales.view(broadcast_shape)
 
-    return coords
+    return coords * scales - 1.0
 
 
 def coords_to_disp(
@@ -472,7 +622,6 @@ def spatial_transform(
         - Affine matrix: shape (N+1, N+1) or (N, N+1)
         - Batched affine matrix: shape (B, N+1, N+1) or (B, N, N+1)
         - Displacement field: shape (N, *spatial) or (B, N, *spatial) - channels-first
-        - Coordinate field: shape (*spatial, N) or (B, *spatial, N) - channels-last for grid_sample
         - None: returns image unchanged
     mode : {'linear', 'nearest'}, default='linear'
         Interpolation mode. 'linear' will auto-detect appropriate mode (bilinear/trilinear) based
@@ -564,11 +713,8 @@ def spatial_transform(
     trf_has_batch_dim = trf.ndim > (num_spatial + 1)
 
     if isdisp:
-        if trf_has_batch_dim:
-            coords_list = [disp_to_coords(trf[i], meshgrid=meshgrid) for i in range(trf.shape[0])]
-            trf = torch.stack(coords_list, dim=0)
-        else:
-            trf = disp_to_coords(trf, meshgrid=meshgrid)
+        trf_non_spatial = (0,) if trf_has_batch_dim else None
+        trf = disp_to_coords(trf, meshgrid=meshgrid, non_spatial_dims=trf_non_spatial)
 
     # Convert (ndim, *spatial) -> (*spatial, ndim) for grid_sample
     # and flip coordinate order (grid_sample expects reversed spatial dims)
@@ -617,27 +763,229 @@ def spatial_transform(
 def integrate_disp(
     disp: torch.Tensor,
     steps: int,
-    meshgrid: Union[torch.Tensor, None] = None
+    meshgrid: Union[torch.Tensor, None] = None,
+    non_spatial_dims: Union[Tuple[int, ...], None] = None,
 ) -> torch.Tensor:
     """
-    TODOC
-    """
-    if meshgrid is None:
-        meshgrid = ne.volshape_to_ndgrid(size=disp.shape[1:], device=disp.device, stack=True)
+    Integrate a stationary velocity field to produce a displacement field.
 
+    Uses the scaling-and-squaring method to efficiently compute the exponential
+    map of the velocity field.
+
+    Parameters
+    ----------
+    disp : torch.Tensor
+        Velocity field with shape (ndim, *spatial) or (B, ndim, *spatial) if batched.
+    steps : int
+        Number of integration steps. The velocity is divided by 2^steps and then
+        composed with itself 2^steps times. More steps = more accurate but slower.
+    meshgrid : torch.Tensor or None, default=None
+        Pre-computed coordinate grid of shape (ndim, *spatial). If None, computed
+        from displacement field shape.
+    non_spatial_dims : Tuple[int, ...] or None, default=None
+        Indices of non-spatial dimensions:
+        - None: tensor is (ndim, *spatial), unbatched
+        - (0,): tensor is (B, ndim, *spatial), batched
+
+    Returns
+    -------
+    torch.Tensor
+        Integrated displacement field with same shape as input.
+
+    Examples
+    --------
+    >>> import voxelmorph as vxm
+    >>> # Unbatched velocity field
+    >>> vel = torch.randn(2, 64, 64) * 0.1
+    >>> disp = vxm.integrate_disp(vel, steps=7)
+    >>> disp.shape
+    torch.Size([2, 64, 64])
+
+    >>> # Batched velocity field
+    >>> vel = torch.randn(4, 2, 64, 64) * 0.1
+    >>> disp = vxm.integrate_disp(vel, steps=7, non_spatial_dims=(0,))
+    >>> disp.shape
+    torch.Size([4, 2, 64, 64])
+    """
     if steps == 0:
         return disp
 
+    # Parse dimensions
+    num_non_spatial, num_spatial = ne.functional._parse_non_spatial_dims(
+        non_spatial_dims=non_spatial_dims,
+        tensor_ndim=disp.ndim - 1  # subtract 1 for ndim dimension
+    )
+
+    has_batch = num_non_spatial == 1
+
+    # Determine spatial shape and create meshgrid if needed
+    if has_batch:
+        spatial_shape = disp.shape[2:]
+        st_non_spatial_dims = (0, 1)  # batch and ndim for spatial_transform
+    else:
+        spatial_shape = disp.shape[1:]
+        st_non_spatial_dims = (0,)  # just ndim for spatial_transform
+
+    if meshgrid is None:
+        meshgrid = ne.volshape_to_ndgrid(
+            size=spatial_shape, device=disp.device, dtype=disp.dtype, stack=True
+        )
+
+    # Scaling and squaring
     disp = disp / (2 ** steps)
     for _ in range(steps):
-        disp = disp + spatial_transform(disp, disp, meshgrid=meshgrid, non_spatial_dims=(0,))
+        disp = disp + spatial_transform(
+            disp, disp, meshgrid=meshgrid, non_spatial_dims=st_non_spatial_dims
+        )
+
+    return disp
+
+
+def resize_disp(
+    disp: torch.Tensor,
+    scale_factor: Union[float, Sequence[float], None] = None,
+    shape: Union[Sequence[int], None] = None,
+    mode: Literal['linear', 'nearest'] = 'linear',
+    non_spatial_dims: Union[Tuple[int, ...], None] = None,
+) -> torch.Tensor:
+    """
+    Resize a displacement field spatially and scale magnitudes proportionally.
+
+    When resizing a displacement field, the vector magnitudes must be scaled along with
+    the spatial dimensions. A 1-pixel displacement in a 64x64 field should become a
+    2-pixel displacement when upsampled to 128x128.
+
+    Parameters
+    ----------
+    disp : torch.Tensor
+        Displacement field with shape (ndim, *spatial) or (B, ndim, *spatial) if batched.
+    scale_factor : float, Sequence[float], or None, default=None
+        Factor by which to scale spatial dimensions. Values > 1 upsample, < 1 downsample.
+        Can be a scalar (uniform scaling) or a sequence with one factor per spatial dimension.
+        Mutually exclusive with `shape`.
+    shape : Sequence[int] or None, default=None
+        Target spatial shape. Mutually exclusive with `scale_factor`.
+    mode : {'linear', 'nearest'}, default='linear'
+        Interpolation mode for spatial resizing.
+    non_spatial_dims : Tuple[int, ...] or None, default=None
+        Indices of non-spatial dimensions:
+        - None: tensor is (ndim, *spatial), unbatched
+        - (0,): tensor is (B, ndim, *spatial), batched
+
+    Returns
+    -------
+    torch.Tensor
+        Resized displacement field with same batch structure as input.
+
+    Examples
+    --------
+    >>> # Upsample 2x using scale_factor
+    >>> disp = torch.randn(2, 32, 32)
+    >>> resized = resize_disp(disp, scale_factor=2.0)
+    >>> resized.shape
+    torch.Size([2, 64, 64])
+
+    >>> # Downsample to specific shape
+    >>> disp = torch.randn(3, 64, 64, 64)
+    >>> resized = resize_disp(disp, shape=(32, 32, 32))
+    >>> resized.shape
+    torch.Size([3, 32, 32, 32])
+
+    >>> # Magnitude scaling: 1-pixel shift becomes 2-pixel shift when upsampled 2x
+    >>> disp = torch.ones(2, 4, 4)  # constant 1-pixel shift
+    >>> resized = resize_disp(disp, scale_factor=2.0)
+    >>> resized[0, 0, 0].item()  # now 2-pixel shift
+    2.0
+
+    >>> # Batched displacement field
+    >>> disp = torch.randn(4, 2, 32, 32)
+    >>> resized = resize_disp(disp, scale_factor=2.0, non_spatial_dims=(0,))
+    >>> resized.shape
+    torch.Size([4, 2, 64, 64])
+
+    Notes
+    -----
+    Exactly one of `scale_factor` or `shape` must be provided.
+    """
+    assert (scale_factor is None) != (shape is None), (
+        "Exactly one of `scale_factor` or `shape` must be provided"
+    )
+
+    # Parse dimensions
+    num_non_spatial, num_spatial = ne.functional._parse_non_spatial_dims(
+        non_spatial_dims=non_spatial_dims,
+        tensor_ndim=disp.ndim - 1  # subtract 1 for ndim dimension
+    )
+
+    has_batch = num_non_spatial == 1
+
+    # Determine spatial shape
+    if has_batch:
+        spatial_shape = disp.shape[2:]
+    else:
+        spatial_shape = disp.shape[1:]
+
+    ndim = len(spatial_shape)
+
+    if shape is not None:
+        assert len(shape) == ndim, (
+            f"shape has {len(shape)} dims but disp has {ndim} spatial dims"
+        )
+        scale_factors = [shape[i] / spatial_shape[i] for i in range(ndim)]
+
+    elif isinstance(scale_factor, (list, tuple)):
+        assert len(scale_factor) == ndim, (
+            f"scale_factor has {len(scale_factor)} elements but disp has {ndim} spatial dims"
+        )
+        scale_factors = list(scale_factor)
+    else:
+        scale_factors = [scale_factor] * ndim
+
+    if all(s == 1.0 for s in scale_factors):
+        return disp
+
+    # Determine interpolation mode and parameters
+    if mode == 'linear':
+        interp_mode = ne.utils.infer_linear_interpolation_mode(ndim)
+        align_corners = True
+    else:
+        interp_mode = 'nearest'
+        align_corners = None
+
+    # interpolate expects (B, C, *spatial) - add batch dim if unbatched
+    if not has_batch:
+        disp = disp.unsqueeze(0)
+
+    disp = torch.nn.functional.interpolate(
+        disp,
+        size=tuple(shape) if shape is not None else None,
+        scale_factor=tuple(scale_factors) if shape is None else None,
+        mode=interp_mode,
+        align_corners=align_corners
+    )
+
+    if not has_batch:
+        disp = disp.squeeze(0)
+
+    # Scale each displacement component by its corresponding dimension's factor
+    # Shape: (1, ndim, 1, 1, ...) for batched, (ndim, 1, 1, ...) for unbatched
+    if has_batch:
+        scale_tensor = torch.tensor(
+            scale_factors, device=disp.device, dtype=disp.dtype
+        ).view(1, -1, *[1] * ndim)
+    else:
+        scale_tensor = torch.tensor(
+            scale_factors, device=disp.device, dtype=disp.dtype
+        ).view(-1, *[1] * ndim)
+
+    disp = disp * scale_tensor
 
     return disp
 
 
 def compose(
     transforms: Sequence[torch.Tensor],
-    interpolation_mode: str = 'bilinear',
+    interpolation_mode: str = 'linear',
     origin_at_center: bool = True,
     shape: Union[Sequence[int], None] = None,
 ) -> torch.Tensor:
@@ -654,9 +1002,9 @@ def compose(
         List or tuple of affine matrices and/or displacement fields to compose.
         - Affine matrices: shape (..., N, N+1) or (..., N+1, N+1)
         - Displacement fields: shape (ndim, *spatial) or (B, ndim, *spatial)
-    interpolation_mode : str, default='bilinear'
-        Interpolation method for composing displacement fields.
-        Options: 'bilinear', 'nearest', 'trilinear'.
+    interpolation_mode : str, default='linear'
+        Interpolation method for composing displacement fields. Options are:
+        {'linear', 'nearest'}.
     origin_at_center : bool, default=True
         Shift grid origin to image center when converting affine matrices to displacement fields.
     shape : Sequence[int] or None, default=None
@@ -1039,13 +1387,10 @@ def random_disp(
 
     # Apply integration if requested
     if integrations > 0:
-        if has_batch:
-            disp = torch.stack([
-                integrate_disp(disp[i], integrations, meshgrid)
-                for i in range(disp.shape[0])
-            ])
-        else:
-            disp = integrate_disp(disp, integrations, meshgrid)
+        disp = integrate_disp(
+            disp, integrations, meshgrid,
+            non_spatial_dims=(0,) if has_batch else None
+        )
 
     return disp
 

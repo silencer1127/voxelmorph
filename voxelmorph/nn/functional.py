@@ -3,7 +3,7 @@ Functions containing the core operations and logic of for image registration for
 written in PyTorch.
 """
 
-# Standard library imports
+# Core library imports
 from typing import List, Union, Sequence, Literal
 
 # Third-party imports
@@ -34,7 +34,6 @@ def spatial_transform(
         Transformation field. Can be:
         - Affine matrix: shape (N+1, N+1) or (N, N+1)
         - Displacement field: shape (N, *spatial) - channels-first format
-        - Coordinate field: shape (*spatial, N) - channels-last for grid_sample
         - None: returns image unchanged
     method : str, default='linear'
         Interpolation mode ('linear' or 'nearest').
@@ -67,7 +66,7 @@ def spatial_transform(
     >>> warped.shape
     torch.Size([1, 1, 64, 64, 64])
     """
-    return vxm.functional.spatial_transform(
+    return vxm.spatial_transform(
         image=image,
         trf=trf,
         mode=method,
@@ -208,19 +207,12 @@ def integrate_disp(
     >>> disp.shape
     torch.Size([1, 3, 32, 32, 32])
     """
-    batch_size = disp.shape[0]
-
-    integrated = torch.stack([
-        vxm.integrate_disp(disp[i], steps=steps, meshgrid=meshgrid)
-        for i in range(batch_size)
-    ])
-
-    return integrated
+    return vxm.integrate_disp(disp, steps=steps, meshgrid=meshgrid, non_spatial_dims=(0,))
 
 
 def compose(
     transforms: Sequence[torch.Tensor],
-    interpolation_mode: str = 'bilinear',
+    interpolation_mode: str = 'linear',
     origin_at_center: bool = True,
     shape: Union[Sequence[int], None] = None
 ) -> torch.Tensor:
@@ -237,8 +229,8 @@ def compose(
         List of transforms to compose. Each transform should be:
         - Displacement field: shape (B, ndim, *spatial)
         - Affine matrix: shape (N, N+1) or (N+1, N+1) or batched (B, N, N+1)
-    interpolation_mode : str, default='bilinear'
-        Interpolation method for composing displacement fields.
+    interpolation_mode : str, default='linear'
+        Interpolation method for composing displacement fields. Options are {'linear', 'nearest'}.
     origin_at_center : bool, default=True
         Place origin at image center when converting affine matrices to displacement.
     shape : Sequence[int] or None, default=None

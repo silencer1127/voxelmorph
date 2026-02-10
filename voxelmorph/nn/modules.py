@@ -2,16 +2,16 @@
 Neural network building blocks for VoxelMorph.
 """
 
-# Standard library imports
+# Core library imports
 from typing import Union, Optional
 
 # Third-party imports
 import torch
 import torch.nn as nn
 import torch.nn.functional as nnf
-
-# Custom imports
 import neurite as ne
+
+# Local imports
 import voxelmorph as vxm
 
 
@@ -33,7 +33,7 @@ class SpatialTransformer(nn.Module):
 
     def __init__(
         self,
-        interpolation_mode: str = "bilinear",
+        interpolation_mode: str = "linear",
         align_corners: bool = True,
         device: Optional[Union[str, torch.device]] = None,
     ):
@@ -42,11 +42,8 @@ class SpatialTransformer(nn.Module):
 
         Parameters
         ----------
-        size : tuple[int] or None, optional
-            Deprecated. No longer used. Kept for backward compatibility.
-        interpolation_mode : str, default='bilinear'
-            Algorithm used for interpolating the warped image. Options are:
-            'bilinear' | 'nearest' | 'bicubic'.
+        interpolation_mode : str, default='linear'
+            Algorithm used for interpolating the warped image. Options are: {'linear', 'nearest'}
         align_corners : bool, default=True
             Map the corner points of the moving image to the corner points of the warped image.
         device : str or torch.device or None, optional
@@ -83,7 +80,7 @@ class SpatialTransformer(nn.Module):
         Notes
         -----
         - Expects deformation_field in channels-first format: (B, ndim, *spatial_dims)
-        - Processes each batch element independently since vxm.functional.spatial_transform
+        - Processes each batch element independently since vxm.spatial_transform
           expects displacement fields without batch dimension
         """
         assert moving_image.dim() >= 4, (
@@ -103,7 +100,7 @@ class SpatialTransformer(nn.Module):
                 stack=True
             )
 
-        return vxm.functional.spatial_transform(
+        return vxm.spatial_transform(
             image=moving_image,
             trf=deformation_field,
             mode=self.interpolation_mode,
@@ -153,7 +150,7 @@ class IntegrateVelocityField(nn.Module):
         self,
         shape: Optional[tuple] = None,
         steps: int = 1,
-        interpolation_mode: str = "bilinear",
+        interpolation_mode: str = "linear",
         align_corners: bool = True,
         device: Optional[str] = None
     ):
@@ -167,9 +164,8 @@ class IntegrateVelocityField(nn.Module):
         steps : int, default=1
             Number of integration steps. A higher value leads to a more smooth and accurate
             integration at the cost of higher/longer computation.
-        interpolation_mode : str, default='bilinear'
-            Algorithm used for interpolating the warped image. Options are:
-            'bilinear' | 'nearest' | 'bicubic'.
+        interpolation_mode : str, default='linear'
+            Algorithm used for interpolating the warped image. Options are {'linear', 'nearest'}
         align_corners : bool, default=True
             Map the corner points of the moving image to the corner points of the warped image.
         device : str or None, optional
@@ -237,7 +233,7 @@ class ResizeDisplacementField(nn.Module):
     def __init__(
         self,
         scale_factor: Optional[Union[float, int]] = 1.0,
-        interpolation_mode: str = "bilinear",
+        interpolation_mode: str = "linear",
         align_corners: bool = True,
     ):
         """
@@ -250,8 +246,8 @@ class ResizeDisplacementField(nn.Module):
             Values of `scale_factor` > 1 stretch/expand the field, and values < 1 shrink it. By
             default 1.0.
         interpolation_mode : str
-            Algorithm used for interpolating the warped image. Default is  'bilinear'. Options are:
-            'bilinear' | 'nearest' | 'bicubic', 'trilinear'.
+            Algorithm used for interpolating the warped image. Options are {'linear', 'nearest',
+            'bicubic'}
         align_corners : bool
             Map the corner points of the moving image to the corner points of the warped image.
         """
@@ -262,24 +258,30 @@ class ResizeDisplacementField(nn.Module):
 
     def forward(self, disp: torch.Tensor) -> torch.Tensor:
         """
-        Instantiate the `ResizeDisplacementField` object.
+        Resize and rescale the displacement field.
 
         Parameters
         ----------
         disp : torch.Tensor
-            Vector field of shape (B, C, H, W) representing a displacement field, where C represents
-            each spatial component of the vector field.
+            Vector field of shape (B, C, *spatial) representing a displacement field, where C
+            represents each spatial component of the vector field.
 
         Returns
         -------
         torch.Tensor
             Resized displacement field.
         """
+        # Infer PyTorch interpolation mode from spatial dimensions
+        mode = self.interpolation_mode
+        if mode == 'linear':
+            num_spatial = disp.ndim - 2  # Subtract batch and channel dims
+            mode = ne.utils.infer_linear_interpolation_mode(num_spatial)
+
         # Use the scale factor to resize the displacement field
         resized_disp = nnf.interpolate(
             disp * self.scale_factor,  # Scale the magnitudes of the displacement field
             scale_factor=self.scale_factor,
-            mode=self.interpolation_mode,
+            mode=mode,
             align_corners=self.align_corners,
         )
 
