@@ -2,7 +2,7 @@
 Single tensor operations (no B, C, dimensions assumption)
 """
 # Core library imports
-from typing import Union, Sequence, Tuple, Literal
+from typing import Union, Sequence, Tuple, Literal, Optional
 
 # Third-party imports
 import numpy as np
@@ -395,7 +395,7 @@ def disp_to_trf(
     trf_to_disp : Inverse operation.
     """
     if grid is None:
-        num_non_spatial, _ = ne.functional._parse_non_spatial_dims(non_spatial_dims, disp.dim())
+        num_non_spatial, _ = ne.functional.parse_non_spatial_dims(non_spatial_dims, disp.dim())
         spatial_shape = disp.shape[num_non_spatial + 1:]
         grid = ne.volshape_to_ndgrid(
             size=spatial_shape, device=disp.device, dtype=disp.dtype, stack=True
@@ -457,7 +457,7 @@ def trf_to_disp(
     disp_to_trf : Inverse operation.
     """
     if grid is None:
-        num_non_spatial, _ = ne.functional._parse_non_spatial_dims(non_spatial_dims, trf.dim())
+        num_non_spatial, _ = ne.functional.parse_non_spatial_dims(non_spatial_dims, trf.dim())
         spatial_shape = trf.shape[num_non_spatial + 1:]
         grid = ne.volshape_to_ndgrid(
             size=spatial_shape, device=trf.device, dtype=trf.dtype, stack=True
@@ -467,8 +467,8 @@ def trf_to_disp(
 
 def disp_to_coords(
     disp: torch.Tensor,
-    meshgrid: torch.Tensor | None = None,
-    non_spatial_dims: Tuple[int, ...] | None = None,
+    meshgrid: Optional[torch.Tensor] = None,
+    non_spatial_dims: Optional[Tuple[int, ...]] = None,
 ) -> torch.Tensor:
     """
     Convert displacement field to normalized coordinates in [-1, 1] range for grid_sample.
@@ -506,7 +506,7 @@ def disp_to_coords(
     >>> coords.shape
     torch.Size([4, 2, 64, 64])
     """
-    num_non_spatial, num_spatial = ne.functional._parse_non_spatial_dims(
+    num_non_spatial, num_spatial = ne.functional.parse_non_spatial_dims(
         non_spatial_dims=non_spatial_dims,
         tensor_ndim=disp.ndim - 1  # subtract 1 for ndim dimension
     )
@@ -684,7 +684,7 @@ def spatial_transform(
         return image
 
     # Parse image dimensions to understand shape
-    num_non_spatial, num_spatial = ne.functional._parse_non_spatial_dims(
+    num_non_spatial, num_spatial = ne.functional.parse_non_spatial_dims(
         non_spatial_dims, image.ndim
     )
     spatial_shape = image.shape[num_non_spatial:]
@@ -811,7 +811,7 @@ def integrate_disp(
         return disp
 
     # Parse dimensions
-    num_non_spatial, num_spatial = ne.functional._parse_non_spatial_dims(
+    num_non_spatial, num_spatial = ne.functional.parse_non_spatial_dims(
         non_spatial_dims=non_spatial_dims,
         tensor_ndim=disp.ndim - 1  # subtract 1 for ndim dimension
     )
@@ -912,7 +912,7 @@ def resize_disp(
     )
 
     # Parse dimensions
-    num_non_spatial, num_spatial = ne.functional._parse_non_spatial_dims(
+    num_non_spatial, num_spatial = ne.functional.parse_non_spatial_dims(
         non_spatial_dims=non_spatial_dims,
         tensor_ndim=disp.ndim - 1  # subtract 1 for ndim dimension
     )
@@ -1286,7 +1286,7 @@ def random_disp(
     meshgrid: Union[torch.Tensor, None] = None,
     non_spatial_dims: Union[Sequence[int], None] = None,
     device: Union[torch.device, None] = None,
-    method: Literal['blur', 'upsample'] = 'upsample'
+    fractal_mode: Literal['blur', 'upsample'] = 'upsample'
 ) -> torch.Tensor:
     """
     Generate random displacement field using fractal noise.
@@ -1302,9 +1302,9 @@ def random_disp(
         - non_spatial_dims=(0,): (B, *spatial), output is (B, ndim, *spatial)
     scales : float, int, or Sequence[float or int], default=10
         Smoothing scale(s) for fractal noise, divided by voxsize. Interpretation depends
-        on method:
-        - method='blur': sigma values for Gaussian smoothing
-        - method='upsample': downsampling factors for upsampled noise
+        on fractal_mode:
+        - fractal_mode='blur': sigma values for Gaussian smoothing
+        - fractal_mode='upsample': downsampling factors for upsampled noise
     magnitude : float or int, default=10
         Standard deviation of displacement in voxel coordinates, divided by voxsize.
     integrations : int, default=0
@@ -1320,8 +1320,8 @@ def random_disp(
         - (0,): first dim is batch (B, *spatial)
     device : torch.device or None, default=None
         Device for tensor allocation.
-    method : {'blur', 'upsample'}, default='upsample'
-        Noise generation method:
+    fractal_mode : {'blur', 'upsample'}, default='upsample'
+        Fractal noise generation method:
         - 'blur': Generate noise and apply Gaussian smoothing (higher quality)
         - 'upsample': Generate coarse noise and upsample (faster, lower memory)
 
@@ -1349,7 +1349,7 @@ def random_disp(
     >>> disp.shape
     torch.Size([4, 2, 64, 64])
     """
-    num_non_spatial, num_spatial = ne.functional._parse_non_spatial_dims(
+    num_non_spatial, num_spatial = ne.functional.parse_non_spatial_dims(
         non_spatial_dims=non_spatial_dims,
         tensor_ndim=len(shape)
     )
@@ -1369,17 +1369,17 @@ def random_disp(
     magnitude = magnitude / voxsize
 
     # Generate independent fractal noise for each spatial dimension
-    disp_components = [
-        ne.fractal_noise(
+    disp_components = []
+    for _ in range(num_spatial):
+        noise = ne.fractal_noise(
             shape=shape,
             scales=scales,
             magnitude=magnitude,
             non_spatial_dims=non_spatial_dims,
             device=device,
-            method=method
+            method=fractal_mode,
         )
-        for _ in range(num_spatial)
-    ]
+        disp_components.append(noise)
 
     # Stack: (ndim, *spatial) or (B, ndim, *spatial)
     stack_dim = 1 if has_batch else 0
@@ -1408,7 +1408,7 @@ def random_transform(
     voxsize: Union[float, int] = 1,
     non_spatial_dims: Union[Sequence[int], None] = None,
     device: Union[torch.device, None] = None,
-    method: Literal['blur', 'upsample'] = 'upsample',
+    fractal_mode: Literal['blur', 'upsample'] = 'upsample',
     sampling: bool = True,
 ) -> torch.Tensor:
     """
@@ -1448,8 +1448,8 @@ def random_transform(
         - (0,): first dim is batch (B, *spatial)
     device : torch.device or None, default=None
         Device for tensor allocation.
-    method : {'blur', 'upsample'}, default='upsample'
-        Noise generation method for nonlinear warp.
+    fractal_mode : {'blur', 'upsample'}, default='upsample'
+        Fractal noise generation method for nonlinear warp.
     sampling : bool, default=True
         If True, sample random parameters. If False, use maximum values directly.
 
@@ -1482,7 +1482,7 @@ def random_transform(
     >>> trf.shape
     torch.Size([4, 2, 64, 64])
     """
-    num_non_spatial, num_spatial = ne.functional._parse_non_spatial_dims(
+    num_non_spatial, num_spatial = ne.functional.parse_non_spatial_dims(
         non_spatial_dims=non_spatial_dims,
         tensor_ndim=len(shape)
     )
@@ -1501,7 +1501,7 @@ def random_transform(
         trf = None
 
         # Random affine component
-        if ne.utils.bernoulli(p=affine_probability, shape=(1,)).item():
+        if np.random.rand() < affine_probability:
             matrix = random_affine(
                 ndim=num_spatial,
                 max_translation=max_translation / voxsize,
@@ -1513,7 +1513,7 @@ def random_transform(
             trf = affine_to_disp(matrix, meshgrid)
 
         # Random nonlinear warp component
-        if ne.utils.bernoulli(p=warp_probability, shape=(1,)).item():
+        if np.random.rand() < warp_probability:
             disp = random_disp(
                 shape=spatial_shape,
                 scales=np.random.uniform(*warp_scales_range),
@@ -1521,7 +1521,7 @@ def random_transform(
                 integrations=warp_integrations,
                 voxsize=voxsize,
                 device=device,
-                method=method
+                fractal_mode=fractal_mode
             )
             if trf is None:
                 trf = disp
